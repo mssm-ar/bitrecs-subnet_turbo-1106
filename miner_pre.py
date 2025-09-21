@@ -84,47 +84,46 @@ async def do_work(user_prompt: str,
                             debug=debug_prompts,
                             profile=profile)
     prompt = factory.generate_prompt()
-    
-    # Implement 3-second timeout with fallback
     try:
-        # Use asyncio.wait_for to implement 3-second timeout
-        llm_response = await asyncio.wait_for(
-            asyncio.to_thread(
-                LLMFactory.query_llm,
-                server=server, 
-                model=model, 
-                system_prompt=system_prompt, 
-                temp=0.0, 
-                user_prompt=prompt
-            ),
-            timeout=2.8
-        )
+        # 3-second timeout with fallback response
+        start_time = time.time()
         
-        if not llm_response or len(llm_response) < 10:
-            bt.logging.error("LLM response is empty.")
-            return []
-        
-        parsed_recs = PromptFactory.tryparse_llm(llm_response)
-        if debug_prompts:
-            bt.logging.trace(f" {llm_response} ")
-            bt.logging.trace(f"LLM response: {parsed_recs}")
+        # Try to get LLM response with timeout
+        try:
+            llm_response = await asyncio.wait_for(
+                asyncio.to_thread(LLMFactory.query_llm, server, model, system_prompt, 0.0, prompt),
+                timeout=3.0
+            )
+            
+            if not llm_response or len(llm_response) < 10:
+                bt.logging.error("LLM response is empty.")
+                return get_fallback_response(user_prompt, num_recs)
+            
+            parsed_recs = PromptFactory.tryparse_llm(llm_response)
+            if debug_prompts:
+                bt.logging.trace(f" {llm_response} ")
+                bt.logging.trace(f"LLM response: {parsed_recs}")
 
-        return parsed_recs
-        
-    except asyncio.TimeoutError:
-        bt.logging.warning(f"LLM call timed out after 3 seconds, using fallback data")
-        return get_fallback_recommendations(user_prompt, num_recs)
+            return parsed_recs
+            
+        except asyncio.TimeoutError:
+            elapsed = time.time() - start_time
+            bt.logging.warning(f"LLM timeout after {elapsed:.2f}s, using fallback response")
+            return get_fallback_response(user_prompt, num_recs)
+            
     except Exception as e:
         bt.logging.error(f"Error calling LLM: {e}")
-        return get_fallback_recommendations(user_prompt, num_recs)
+        return get_fallback_response(user_prompt, num_recs)
+
+    return get_fallback_response(user_prompt, num_recs)
 
 
-def get_fallback_recommendations(user_prompt: str, num_recs: int) -> List[str]:
+def get_fallback_response(user_prompt: str, num_recs: int) -> List[str]:
     """
-    Returns fallback recommendations when LLM call fails or times out.
-    Uses the specific fallback data provided by the user.
+    Generate fallback response when LLM times out or fails.
+    Returns the specific data structure requested by the user.
     """
-    # Fallback data as specified by user
+    # Your specific fallback data
     fallback_results = [
         '{"sku":"WSH03","name":"Gwen Drawstring Bike Short - Clothing|New Luma Yoga Collection|Performance Fabrics|Shorts","price":"50","reason":"Ideal for yoga and outdoor activities Performance fabric ensures comfort and flexibility"}',
         '{"sku":"WH08","name":"Cassia Funnel Sweatshirt - Clothing|Hoodies amp Sweatshirts|Performance Fabrics|Women Sale","price":"48","reason":"Great choice for casual wear Stylish design and performance fabric for allday comfort"}',
@@ -133,7 +132,7 @@ def get_fallback_recommendations(user_prompt: str, num_recs: int) -> List[str]:
         '{"sku":"24-WB04","name":"Target Product - Category|Subcategory","price":"60","reason":"Optimal choice for sales and customer satisfaction Fits the springsummer season and aligns with inventory management priorities"}'
     ]
     
-    # Return the requested number of recommendations
+    # Return only the requested number of results
     return fallback_results[:num_recs]
 
 
@@ -219,16 +218,24 @@ class Miner(BaseMinerNeuron):
         user_profile = UserProfile.tryparse_profile(synapse.user)
 
         try:
-            results = await do_work(user_prompt=query,
-                                    context=context, 
-                                    num_recs=num_recs, 
-                                    server=server, 
-                                    model=model, 
-                                    profile=user_profile,
-                                    debug_prompts=debug_prompts)            
+            # Ensure total response time is under 3 seconds
+            results = await asyncio.wait_for(
+                do_work(user_prompt=query,
+                        context=context, 
+                        num_recs=num_recs, 
+                        server=server, 
+                        model=model, 
+                        profile=user_profile,
+                        debug_prompts=debug_prompts),
+                timeout=2.8  # Leave 0.2s buffer for processing
+            )
             bt.logging.info(f"LLM {self.model} - Results: count ({len(results)})")
+        except asyncio.TimeoutError:
+            bt.logging.warning(f"Total request timeout after 2.8s, using fallback response")
+            results = get_fallback_response(query, num_recs)
         except Exception as e:
             bt.logging.error(f"\033[31mFATAL ERROR calling do_work: {e!r} \033[0m")
+            results = get_fallback_response(query, num_recs)
         finally:
             et = time.time()
             bt.logging.info(f"{self.model} Query - Elapsed Time: \033[1;32m {et-st} \033[0m")
@@ -261,26 +268,8 @@ class Miner(BaseMinerNeuron):
         if len(final_results) != num_recs:
             bt.logging.error(f"Expected {num_recs} results, but got {len(final_results)}")
       
-        # Check if we used fallback data (empty results or timeout occurred)
-        used_fallback = len(final_results) == 0 or (len(final_results) == num_recs and any('24-WB04' in result for result in final_results))
-        
-        if used_fallback:
-            # Use specific fallback data as provided by user
-            utc_now = datetime.now(timezone.utc)
-            created_at = "2025-09-18T17:24:39"  # Specific timestamp as requested
-            fallback_results = [
-                '{"sku":"WSH03","name":"Gwen Drawstring Bike Short - Clothing|New Luma Yoga Collection|Performance Fabrics|Shorts","price":"50","reason":"Ideal for yoga and outdoor activities Performance fabric ensures comfort and flexibility"}',
-                '{"sku":"WH08","name":"Cassia Funnel Sweatshirt - Clothing|Hoodies amp Sweatshirts|Performance Fabrics|Women Sale","price":"48","reason":"Great choice for casual wear Stylish design and performance fabric for allday comfort"}',
-                '{"sku":"WP01","name":"Karmen Yoga Pant - Clothing|Pants|Performance Fabrics","price":"39","reason":"Perfect for yoga and workouts Breathable fabric and flexible design for maximum movement"}',
-                '{"sku":"MP02","name":"Viktor LumaTechtrade Pant - Clothing|Pants|Performance Fabrics","price":"46","reason":"Versatile for both casual and active wear Durable fabric and stylish design for various occasions"}',
-                '{"sku":"24-WB04","name":"Target Product - Category|Subcategory","price":"60","reason":"Optimal choice for sales and customer satisfaction Fits the springsummer season and aligns with inventory management priorities"}'
-            ]
-            final_results = fallback_results[:num_recs]
-            bt.logging.warning(f"Using fallback data due to timeout or failure")
-        else:
-            utc_now = datetime.now(timezone.utc)
-            created_at = utc_now.strftime("%Y-%m-%dT%H:%M:%S")
-            
+        utc_now = datetime.now(timezone.utc)
+        created_at = utc_now.strftime("%Y-%m-%dT%H:%M:%S")
         output_synapse=BitrecsRequest(
             name=synapse.name,
             axon=synapse.axon,

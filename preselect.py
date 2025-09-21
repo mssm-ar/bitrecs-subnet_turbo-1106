@@ -60,28 +60,28 @@ class ContextPreSelector:
         
     def pre_select_context(self, query_sku: str, full_context: str, max_products: int = 22, num_recs: int = 5) -> str:
         """
-        Main pre-selection function optimized for consensus participation.
-        GUARANTEES at least num_recs products are returned.
+        Main pre-selection function optimized for direct product selection.
+        Selects exactly num_recs products with smart distribution.
         
         Args:
             query_sku: The SKU being queried (e.g., "WSH04")
             full_context: Full product catalog as JSON string
             max_products: Maximum number of products to return (default: 22 for 700 tokens)
-            num_recs: Minimum number of products to return (default: 5)
+            num_recs: Number of products to return (default: 5)
             
         Returns:
-            JSON string of pre-selected products (ALWAYS at least num_recs)
+            JSON string of pre-selected products (exactly num_recs)
         """
         try:
             # Check cache first
-            cache_key = f"{query_sku}_{hash(full_context)}_{max_products}"
+            cache_key = f"{query_sku}_{hash(full_context)}_{num_recs}"
             if self._is_cached(cache_key):
                 bt.logging.info(f"🎯 CACHE HIT: Using pre-selected context for {query_sku}")
                 return self.cache[cache_key]
             
             # Parse products
             products = json.loads(full_context)
-            if len(products) < 50:  # Don't pre-select small catalogs
+            if len(products) < num_recs:  # Don't pre-select if not enough products
                 return full_context
                 
             # Find query product
@@ -93,33 +93,14 @@ class ContextPreSelector:
             # Extract features from query product
             query_features = self._extract_product_features(query_product)
             
-            # Phase 1: UNION - Collect all relevant groups
-            union_pool = self._collect_union_groups(products, query_features, query_sku)
-            
-            # Phase 2: Weighted scoring for consensus optimization
-            scored_products = self._score_for_consensus(union_pool, query_features, query_sku)
-            
-            # Phase 3: Balanced selection (relevance + diversity)
-            selected_products = self._balanced_selection(scored_products, max_products)
-            
-            # STRICT VALIDATION: Ensure we have at least num_recs products with no duplicates
-            selected_skus = {p.get('sku', '') for p in selected_products}
-            if len(selected_products) < num_recs or len(selected_skus) != len(selected_products):
-                bt.logging.warning(f"Need {num_recs} unique products, have {len(selected_products)} (duplicates: {len(selected_products) - len(selected_skus)}). Adding more...")
-                selected_products = self._ensure_minimum_products(selected_products, products, query_sku, num_recs)
-            
-            # FINAL STRICT VALIDATION: Must have at least num_recs unique products
-            final_skus = {p.get('sku', '') for p in selected_products}
-            if len(selected_products) < num_recs or len(final_skus) != len(selected_products):
-                bt.logging.error(f"❌ CRITICAL ERROR: Still only have {len(selected_products)} products ({len(final_skus)} unique) after ensuring minimum!")
-                # This should never happen, but if it does, return original context
-                return full_context
+            # Direct selection based on query type
+            selected_products = self._direct_product_selection(products, query_features, query_sku, num_recs)
             
             # Cache result
             result = json.dumps(selected_products)
             self._cache_result(cache_key, result)
             
-            bt.logging.info(f"✅ PRE-SELECTION: {len(products)} -> {len(selected_products)} products for {query_sku}")
+            bt.logging.info(f"✅ DIRECT SELECTION: {len(products)} -> {len(selected_products)} products for {query_sku}")
             return result
             
         except Exception as e:
@@ -132,6 +113,156 @@ class ContextPreSelector:
             if product.get('sku', '').upper() == sku.upper():
                 return product
         return None
+    
+    def _direct_product_selection(self, products: List[Dict], query_features: ProductFeatures, query_sku: str, num_recs: int) -> List[Dict]:
+        """
+        Direct product selection with smart distribution based on query type.
+        For gendered products: 50% same gender, 20% same category, remaining for same season/related
+        For non-gendered products: select same category products from context
+        """
+        # Check if query is gendered product
+        is_gendered = query_features.gender != Gender.UNISEX
+        
+        if is_gendered:
+            return self._select_gendered_products(products, query_features, query_sku, num_recs)
+        else:
+            return self._select_ungendered_products(products, query_features, query_sku, num_recs)
+    
+    def _select_gendered_products(self, products: List[Dict], query_features: ProductFeatures, query_sku: str, num_recs: int) -> List[Dict]:
+        """Select products for gendered queries with 50% same gender, 20% same category, remaining for same season/related"""
+        selected = []
+        selected_skus = set()
+        
+        # Calculate flexible distribution numbers
+        same_gender_target = max(1, int(num_recs * 0.5))  # 50% same gender
+        same_category_target = max(1, int(num_recs * 0.2))  # 20% same category
+        remaining_target = num_recs - same_gender_target - same_category_target  # Remaining for same season/related
+        
+        bt.logging.info(f"🎯 GENDERED SELECTION: {same_gender_target} same-gender, {same_category_target} same-category, {remaining_target} same-season/related")
+        
+        # Phase 1: Same gender products (50%)
+        same_gender_count = 0
+        for product in products:
+            if same_gender_count >= same_gender_target:
+                break
+            sku = product.get('sku', '')
+            if sku and sku not in selected_skus and sku.upper() != query_sku.upper():
+                candidate_features = self._extract_product_features(product)
+                if candidate_features.gender == query_features.gender:
+                    selected.append(product)
+                    selected_skus.add(sku)
+                    same_gender_count += 1
+                    bt.logging.info(f"➕ Added same-gender product: {sku} ({candidate_features.gender})")
+        
+        # Phase 2: Same category products (20%)
+        same_category_count = 0
+        for product in products:
+            if same_category_count >= same_category_target:
+                break
+            sku = product.get('sku', '')
+            if sku and sku not in selected_skus and sku.upper() != query_sku.upper():
+                candidate_features = self._extract_product_features(product)
+                if candidate_features.category == query_features.category:
+                    selected.append(product)
+                    selected_skus.add(sku)
+                    same_category_count += 1
+                    bt.logging.info(f"➕ Added same-category product: {sku} ({candidate_features.category})")
+        
+        # Phase 3: Same season or related products (remaining)
+        remaining_count = 0
+        for product in products:
+            if remaining_count >= remaining_target:
+                break
+            sku = product.get('sku', '')
+            if sku and sku not in selected_skus and sku.upper() != query_sku.upper():
+                candidate_features = self._extract_product_features(product)
+                # Check for same season or smart complementary
+                if (self._is_same_season(query_features, candidate_features) or 
+                    self._is_smart_complementary(query_features, candidate_features)):
+                    selected.append(product)
+                    selected_skus.add(sku)
+                    remaining_count += 1
+                    bt.logging.info(f"➕ Added same-season/related product: {sku}")
+        
+        # If we still need more products, add any available
+        if len(selected) < num_recs:
+            bt.logging.info(f"🔧 FILLING REMAINING: Need {num_recs - len(selected)} more products")
+            for product in products:
+                if len(selected) >= num_recs:
+                    break
+                sku = product.get('sku', '')
+                if sku and sku not in selected_skus and sku.upper() != query_sku.upper():
+                    selected.append(product)
+                    selected_skus.add(sku)
+                    bt.logging.info(f"➕ Added filler product: {sku}")
+        
+        # Log final distribution
+        if selected:
+            total = len(selected)
+            same_gender_pct = same_gender_count/total*100
+            same_category_pct = same_category_count/total*100
+            remaining_pct = remaining_count/total*100
+            
+            bt.logging.info(f"✅ GENDERED DISTRIBUTION: {same_gender_count}/{total} same-gender ({same_gender_pct:.1f}%), {same_category_count}/{total} same-category ({same_category_pct:.1f}%), {remaining_count}/{total} same-season/related ({remaining_pct:.1f}%)")
+        
+        return selected[:num_recs]  # Ensure we return exactly num_recs
+    
+    def _select_ungendered_products(self, products: List[Dict], query_features: ProductFeatures, query_sku: str, num_recs: int) -> List[Dict]:
+        """Select products for non-gendered queries - focus on same category products"""
+        selected = []
+        selected_skus = set()
+        
+        bt.logging.info(f"🎯 UNGENDERED SELECTION: Selecting {num_recs} same-category products")
+        
+        # Phase 1: Same category products (primary focus)
+        same_category_count = 0
+        for product in products:
+            if len(selected) >= num_recs:
+                break
+            sku = product.get('sku', '')
+            if sku and sku not in selected_skus and sku.upper() != query_sku.upper():
+                candidate_features = self._extract_product_features(product)
+                if candidate_features.category == query_features.category:
+                    selected.append(product)
+                    selected_skus.add(sku)
+                    same_category_count += 1
+                    bt.logging.info(f"➕ Added same-category product: {sku} ({candidate_features.category})")
+        
+        # Phase 2: If not enough same-category, add related products
+        if len(selected) < num_recs:
+            bt.logging.info(f"🔧 ADDING RELATED: Need {num_recs - len(selected)} more products")
+            for product in products:
+                if len(selected) >= num_recs:
+                    break
+                sku = product.get('sku', '')
+                if sku and sku not in selected_skus and sku.upper() != query_sku.upper():
+                    candidate_features = self._extract_product_features(product)
+                    # Add unisex products or smart complementary
+                    if (candidate_features.gender == Gender.UNISEX or 
+                        self._is_smart_complementary(query_features, candidate_features)):
+                        selected.append(product)
+                        selected_skus.add(sku)
+                        bt.logging.info(f"➕ Added related product: {sku}")
+        
+        # Phase 3: If still not enough, add any available
+        if len(selected) < num_recs:
+            bt.logging.info(f"🔧 FILLING REMAINING: Need {num_recs - len(selected)} more products")
+            for product in products:
+                if len(selected) >= num_recs:
+                    break
+                sku = product.get('sku', '')
+                if sku and sku not in selected_skus and sku.upper() != query_sku.upper():
+                    selected.append(product)
+                    selected_skus.add(sku)
+                    bt.logging.info(f"➕ Added filler product: {sku}")
+        
+        # Log final distribution
+        if selected:
+            total = len(selected)
+            same_category_pct = same_category_count/total*100
+            bt.logging.info(f"✅ UNGENDERED DISTRIBUTION: {same_category_count}/{total} same-category ({same_category_pct:.1f}%), {total - same_category_count}/{total} related/filler ({(total - same_category_count)/total*100:.1f}%)")
+        
+        return selected[:num_recs]  # Ensure we return exactly num_recs
     
     def _extract_product_features(self, product: Dict) -> ProductFeatures:
         """Extract comprehensive features from a product"""
@@ -345,6 +476,56 @@ class ContextPreSelector:
         
         return candidate_features.category in cross_gender_categories
     
+    def _is_same_season(self, query_features: ProductFeatures, candidate_features: ProductFeatures) -> bool:
+        """Determine if products are from the same season based on name/collection patterns"""
+        query_name = query_features.name.lower()
+        candidate_name = candidate_features.name.lower()
+        
+        # Season indicators in product names
+        spring_summer_indicators = [
+            'spring', 'summer', 'tank', 'short', 'sleeveless', 'lightweight', 
+            'breathable', 'cool', 'airy', 'bikini', 'swim', 'beach'
+        ]
+        
+        fall_winter_indicators = [
+            'fall', 'winter', 'warm', 'thermal', 'fleece', 'hoodie', 'sweatshirt',
+            'jacket', 'coat', 'long sleeve', 'heavy', 'insulated', 'wool'
+        ]
+        
+        # Check if both products have similar season indicators
+        query_spring_summer = any(indicator in query_name for indicator in spring_summer_indicators)
+        query_fall_winter = any(indicator in query_name for indicator in fall_winter_indicators)
+        
+        candidate_spring_summer = any(indicator in candidate_name for indicator in spring_summer_indicators)
+        candidate_fall_winter = any(indicator in candidate_name for indicator in fall_winter_indicators)
+        
+        # Same season if both are spring/summer or both are fall/winter
+        if query_spring_summer and candidate_spring_summer:
+            return True
+        if query_fall_winter and candidate_fall_winter:
+            return True
+        
+        # Also check collection-based season matching
+        query_collection = query_features.brand_collection.lower()
+        candidate_collection = candidate_features.brand_collection.lower()
+        
+        # If both are from the same collection, they're likely same season
+        if query_collection == candidate_collection and query_collection != 'standard':
+            return True
+        
+        # Check for seasonal activity patterns
+        if query_features.activity and candidate_features.activity:
+            # Running and fitness are more spring/summer
+            spring_activities = [Activity.RUNNING, Activity.FITNESS]
+            # Yoga and gym can be year-round but lean towards fall/winter
+            fall_activities = [Activity.YOGA, Activity.GYM]
+            
+            if (query_features.activity in spring_activities and candidate_features.activity in spring_activities) or \
+               (query_features.activity in fall_activities and candidate_features.activity in fall_activities):
+                return True
+        
+        return False
+    
     def _score_for_consensus(self, products: List[Dict], query_features: ProductFeatures, query_sku: str) -> List[Tuple[Dict, float]]:
         """Score products for consensus optimization"""
         scored_products = []
@@ -415,8 +596,8 @@ class ContextPreSelector:
         else:
             return 0.2
     
-    def _balanced_selection(self, scored_products: List[Tuple[Dict, float]], max_products: int) -> List[Dict]:
-        """STRICT balanced selection with gender diversity and NO DUPLICATES for consensus optimization"""
+    def _balanced_selection(self, scored_products: List[Tuple[Dict, float]], max_products: int, query_sku: str = None) -> List[Dict]:
+        """STRICT balanced selection with specific distribution: 50% same gender, 20% same category, 20% same season, 10% others"""
         if not scored_products:
             return []
         
@@ -431,67 +612,128 @@ class ContextPreSelector:
         
         scored_products = unique_scored_products
         
-        # Separate products by gender for balanced selection
+        # Get query product features for comparison
+        query_features = None
+        for product, score in scored_products:
+            if product.get('sku', '').upper() == query_sku.upper():
+                query_features = self._extract_product_features(product)
+                break
+        
+        if not query_features:
+            # Fallback: just return top products
+            return [product for product, score in scored_products[:max_products]]
+        
+        # Categorize products based on the new distribution logic
         same_gender = []
-        unisex_products = []
-        cross_gender = []
+        same_category = []
+        same_season = []
+        others = []
         
         for product, score in scored_products:
             sku = product.get('sku', '')
-            if sku.startswith('24-'):  # Unisex
-                unisex_products.append((product, score))
-            elif score >= 0.5:  # High relevance (likely same gender) - increased threshold
+            if sku.upper() == query_sku.upper():
+                continue  # Skip query product
+                
+            product_features = self._extract_product_features(product)
+            
+            # 50% same gender products
+            if product_features.gender == query_features.gender:
                 same_gender.append((product, score))
-            else:  # Lower relevance (likely cross-gender)
-                cross_gender.append((product, score))
+            
+            # 20% same category products (excluding same gender to avoid double counting)
+            elif product_features.category == query_features.category:
+                same_category.append((product, score))
+            
+            # 20% same season products (based on product name/collection)
+            elif self._is_same_season(query_features, product_features):
+                same_season.append((product, score))
+            
+            # 10% others (related to query)
+            else:
+                others.append((product, score))
         
-        # Enhanced gender-focused selection with STRICT no duplicates
+        # Calculate flexible distribution numbers
+        total_needed = min(max_products, len(scored_products))
+        
+        # Flexible numbers within each parameter
+        same_gender_target = max(1, int(total_needed * 0.5))  # 50% ± flexibility
+        same_category_target = max(1, int(total_needed * 0.2))  # 20% ± flexibility  
+        same_season_target = max(1, int(total_needed * 0.2))  # 20% ± flexibility
+        others_target = max(1, int(total_needed * 0.1))  # 10% ± flexibility
+        
+        # Ensure we have at least num_recs products
+        if total_needed < max_products:
+            # Distribute remaining slots proportionally
+            remaining = max_products - total_needed
+            same_gender_target += int(remaining * 0.5)
+            same_category_target += int(remaining * 0.2)
+            same_season_target += int(remaining * 0.2)
+            others_target += int(remaining * 0.1)
+        
         selected = []
         selected_skus = set()
         
-        # 75% same gender (increased to 75% for 70-80% target)
-        same_gender_count = int(max_products * 0.6)
-        for product, score in same_gender[:same_gender_count]:
+        # Select products in priority order
+        bt.logging.info(f"🎯 Distribution targets: {same_gender_target} same-gender, {same_category_target} same-category, {same_season_target} same-season, {others_target} others")
+        
+        # 1. Same gender products (50%)
+        same_gender_selected = 0
+        for product, score in same_gender[:same_gender_target]:
             if len(selected) >= max_products:
                 break
             sku = product.get('sku', '')
             if sku and sku not in selected_skus:
                 selected.append(product)
                 selected_skus.add(sku)
+                same_gender_selected += 1
         
-        # 15% unisex products (reduced to prioritize same gender)
-        unisex_count = int(max_products * 0.15)
-        for product, score in unisex_products[:unisex_count]:
+        # 2. Same category products (20%)
+        same_category_selected = 0
+        for product, score in same_category[:same_category_target]:
             if len(selected) >= max_products:
                 break
             sku = product.get('sku', '')
             if sku and sku not in selected_skus:
                 selected.append(product)
                 selected_skus.add(sku)
+                same_category_selected += 1
         
-        # 10% cross-gender (minimal for variety)
-        cross_gender_count = max_products - len(selected)
-        for product, score in cross_gender[:cross_gender_count]:
+        # 3. Same season products (20%)
+        same_season_selected = 0
+        for product, score in same_season[:same_season_target]:
             if len(selected) >= max_products:
                 break
             sku = product.get('sku', '')
             if sku and sku not in selected_skus:
                 selected.append(product)
                 selected_skus.add(sku)
+                same_season_selected += 1
         
-        # Log gender distribution for debugging (target: 70-80% same-gender)
+        # 4. Others (10%)
+        others_selected = 0
+        for product, score in others[:others_target]:
+            if len(selected) >= max_products:
+                break
+            sku = product.get('sku', '')
+            if sku and sku not in selected_skus:
+                selected.append(product)
+                selected_skus.add(sku)
+                others_selected += 1
+        
+        # Log distribution for debugging
         if selected:
-            same_gender_count = sum(1 for p in selected if not p.get('sku', '').startswith('24-'))
-            unisex_count = sum(1 for p in selected if p.get('sku', '').startswith('24-'))
             total = len(selected)
-            same_gender_pct = same_gender_count/total*100
-            status = "✅" if 50 <= same_gender_pct <= 70 else "⚠️"
-            bt.logging.info(f"{status} Gender Distribution: {same_gender_count}/{total} same-gender ({same_gender_pct:.1f}%), {unisex_count}/{total} unisex ({unisex_count/total*100:.1f}%)")
+            same_gender_pct = same_gender_selected/total*100
+            same_category_pct = same_category_selected/total*100
+            same_season_pct = same_season_selected/total*100
+            others_pct = others_selected/total*100
+            
+            bt.logging.info(f"✅ Distribution: {same_gender_selected}/{total} same-gender ({same_gender_pct:.1f}%), {same_category_selected}/{total} same-category ({same_category_pct:.1f}%), {same_season_selected}/{total} same-season ({same_season_pct:.1f}%), {others_selected}/{total} others ({others_pct:.1f}%)")
         
         return selected
     
     def _ensure_minimum_products(self, selected_products: List[Dict], all_products: List[Dict], query_sku: str, num_recs: int) -> List[Dict]:
-        """STRICT method to ensure we have at least num_recs UNIQUE products with same category priority"""
+        """STRICT method to ensure we have at least num_recs UNIQUE products following distribution logic"""
         # Remove any duplicates from current selection
         seen_skus = set()
         unique_products = []
@@ -505,65 +747,98 @@ class ContextPreSelector:
         selected_skus = seen_skus
         original_count = len(selected_products)
         
-        # Get query product category for same-category priority
+        # Get query product features for distribution logic
         query_product = self._find_product_by_sku(all_products, query_sku)
-        query_category = None
+        query_features = None
         if query_product:
             query_features = self._extract_product_features(query_product)
-            query_category = query_features.category
         
         bt.logging.warning(f"🔧 ENSURING MINIMUM: Need {num_recs} UNIQUE products, have {original_count}")
         
-        # Strategy 1: Add same category products first (NO DUPLICATES)
-        if query_category:
-            bt.logging.info(f"🎯 Priority: Adding same category products ({query_category})")
+        if not query_features:
+            # Fallback: just add any products
             for product in all_products:
                 if len(selected_products) >= num_recs:
                     break
-                    
                 sku = product.get('sku', '')
                 if sku and sku not in selected_skus and sku.upper() != query_sku.upper():
-                    candidate_features = self._extract_product_features(product)
-                    if candidate_features.category == query_category:
-                        selected_products.append(product)
-                        selected_skus.add(sku)
-                        bt.logging.info(f"➕ Added same-category product: {sku} ({candidate_features.category})")
+                    selected_products.append(product)
+                    selected_skus.add(sku)
+            return selected_products
         
-        # Strategy 2: Add any valid products from catalog (NO DUPLICATES)
-        bt.logging.info(f"🔄 Adding any available products...")
+        # Calculate distribution targets for remaining products needed
+        remaining_needed = num_recs - len(selected_products)
+        if remaining_needed <= 0:
+            return selected_products
+        
+        # Calculate targets for distribution
+        same_gender_target = max(1, int(remaining_needed * 0.5))
+        same_category_target = max(1, int(remaining_needed * 0.2))
+        same_season_target = max(1, int(remaining_needed * 0.2))
+        others_target = max(1, int(remaining_needed * 0.1))
+        
+        bt.logging.info(f"🎯 Adding {remaining_needed} more products: {same_gender_target} same-gender, {same_category_target} same-category, {same_season_target} same-season, {others_target} others")
+        
+        # Strategy 1: Add same gender products (50% priority)
+        same_gender_added = 0
         for product in all_products:
-            if len(selected_products) >= num_recs:
+            if len(selected_products) >= num_recs or same_gender_added >= same_gender_target:
                 break
-                
+            sku = product.get('sku', '')
+            if sku and sku not in selected_skus and sku.upper() != query_sku.upper():
+                candidate_features = self._extract_product_features(product)
+                if candidate_features.gender == query_features.gender:
+                    selected_products.append(product)
+                    selected_skus.add(sku)
+                    same_gender_added += 1
+                    bt.logging.info(f"➕ Added same-gender product: {sku} ({candidate_features.gender})")
+        
+        # Strategy 2: Add same category products (20% priority)
+        same_category_added = 0
+        for product in all_products:
+            if len(selected_products) >= num_recs or same_category_added >= same_category_target:
+                break
+            sku = product.get('sku', '')
+            if sku and sku not in selected_skus and sku.upper() != query_sku.upper():
+                candidate_features = self._extract_product_features(product)
+                if candidate_features.category == query_features.category:
+                    selected_products.append(product)
+                    selected_skus.add(sku)
+                    same_category_added += 1
+                    bt.logging.info(f"➕ Added same-category product: {sku} ({candidate_features.category})")
+        
+        # Strategy 3: Add same season products (20% priority)
+        same_season_added = 0
+        for product in all_products:
+            if len(selected_products) >= num_recs or same_season_added >= same_season_target:
+                break
+            sku = product.get('sku', '')
+            if sku and sku not in selected_skus and sku.upper() != query_sku.upper():
+                candidate_features = self._extract_product_features(product)
+                if self._is_same_season(query_features, candidate_features):
+                    selected_products.append(product)
+                    selected_skus.add(sku)
+                    same_season_added += 1
+                    bt.logging.info(f"➕ Added same-season product: {sku}")
+        
+        # Strategy 4: Add others (10% priority)
+        others_added = 0
+        for product in all_products:
+            if len(selected_products) >= num_recs or others_added >= others_target:
+                break
             sku = product.get('sku', '')
             if sku and sku not in selected_skus and sku.upper() != query_sku.upper():
                 selected_products.append(product)
                 selected_skus.add(sku)
-                bt.logging.info(f"➕ Added fallback product: {sku}")
+                others_added += 1
+                bt.logging.info(f"➕ Added other product: {sku}")
         
-        # Strategy 3: Add similar products from context.json if still not enough (NO DUPLICATES)
-        if len(selected_products) < num_recs:
-            bt.logging.warning(f"⚠️ Still need {num_recs - len(selected_products)} more products, adding similar products from context.json...")
-            similar_products = self._get_similar_products_from_context(
-                num_recs - len(selected_products), 
-                query_sku, 
-                selected_skus, 
-                query_category
-            )
-            for product in similar_products:
-                sku = product.get('sku', '')
-                if sku and sku not in selected_skus:
-                    selected_products.append(product)
-                    selected_skus.add(sku)
-            bt.logging.info(f"➕ Added {len(similar_products)} similar products from context.json")
-        
-        # Strategy 4: If still not enough, add any products (NO DUPLICATES)
+        # Strategy 5: If still not enough, add any remaining products
         if len(selected_products) < num_recs:
             bt.logging.warning(f"⚠️ Still need {num_recs - len(selected_products)} more products, adding any available...")
             for product in all_products:
                 if len(selected_products) >= num_recs:
                     break
-                    
                 sku = product.get('sku', '')
                 if sku and sku not in selected_skus and sku.upper() != query_sku.upper():
                     selected_products.append(product)
@@ -691,16 +966,16 @@ _preselector = ContextPreSelector()
 
 def pre_select_context(query_sku: str, full_context: str, max_products: int = 22, num_recs: int = 5) -> str:
     """
-    Convenience function for pre-selecting products from context.
-    GUARANTEES at least num_recs products are returned.
+    Convenience function for direct product selection from context.
+    Returns exactly num_recs products with smart distribution.
     
     Args:
         query_sku: The SKU being queried (e.g., "WSH04")
         full_context: Full product catalog as JSON string
         max_products: Maximum number of products to return (default: 22 for 700 tokens)
-        num_recs: Minimum number of products to return (default: 5)
+        num_recs: Number of products to return (default: 5)
         
     Returns:
-        JSON string of pre-selected products (ALWAYS at least num_recs)
+        JSON string of pre-selected products (exactly num_recs)
     """
     return _preselector.pre_select_context(query_sku, full_context, max_products, num_recs)

@@ -124,11 +124,6 @@ class PromptFactory:
             # Fallback to default persona
             persona_data = self.PERSONAS["ecommerce_retail_store_manager"]
 
-        # Ultra-minimal prompt for 1-3 second response time
-        # Aggressive context truncation (500 chars = ~125 tokens max)
-        # context_str = str(self.context)
-        # if len(context_str) > 600:  # Reduced from 800 for faster processing
-        #     context_str = context_str[:600] + "..."
         # Load context.json file with caching (load once, use many times)
         if not PromptFactory._context_loaded:
             try:
@@ -147,49 +142,40 @@ class PromptFactory:
         
         full_context = PromptFactory._context_cache
         
-        context_str = pre_select_context(self.sku, full_context, max_products=5, num_recs=self.num_recs)
+        # Pre-select exactly num_recs products for faster processing
+        context_str = pre_select_context(self.sku, full_context, max_products=self.num_recs, num_recs=self.num_recs)
         
-        # Simplified persona - only essential info
+        # Parse preselected products to extract relevant info
         try:
-            persona_priorities = ', '.join(persona_data['priorities'])  
-        except (KeyError, IndexError, TypeError) as e:
-            bt.logging.error(f"Error extracting persona priorities: {e}")
-            persona_priorities = "quality, value, customer satisfaction"  # Fallback priorities
+            preselected_products = json.loads(context_str)
+            product_names = [p.get('name', '') for p in preselected_products[:self.num_recs]]
+            product_skus = [p.get('sku', '') for p in preselected_products[:self.num_recs]]
+        except:
+            preselected_products = []
+            product_names = []
+            product_skus = []
         
-        # Minimal cart context (only if essential)
-        cart_context = ""
-        if hasattr(self, 'cart') and self.cart and len(self.cart) > 0:
-            cart_items = [item.get('sku', '') for item in self.cart] 
-            if cart_items:
-                cart_context = f"\nCart: {', '.join(cart_items)}"
-            
+        # Optimized prompt for description generation only
         prompt = f"""
-            You are a recommender system.
-            Input:
-            - target_sku: {self.sku}
-            - season: {season}
-            - persona: {persona_data['description']}
-            - priorities: {persona_priorities}
-            - cart: {cart_context}
-            - context_products: {context_str}
-
-            Output Rules:
-            - Return ONLY a JSON array.
-            - Exactly {self.num_recs} items.
-            - Items must come from context_products only.
-            - Exclude target_sku and items already in cart.
-            - No duplicates.
-            - Respect gender (neutral → neutral).
-            - Keep pet and baby products separate.
-
-            Reason Guidelines:
-            - Each item must have: "sku", "name", "price", "reason".
-            - Reason = detailed explanation (around 10 words) with specific context.
-            - Include specific use cases and lifestyle scenarios.
-            - Vary reasoning styles (Perfect/Ideal/Great choice/etc.).
-
-            Format:
-            [{{"sku": "ABC", "name": "Product Name - Category | Subcategory", "price": "99", "reason": "Detailed explanation with use case/lifestyle scenario. Vary phrasingof why this product fits perfectly"}}]
+            You are a product description generator.
+            
+            Task: Generate descriptions for {self.num_recs} preselected products.
+            
+            Target Product: {self.sku}
+            Season: {season}
+            Persona: {persona_data['description']}
+            
+            Preselected Products: {json.dumps(preselected_products[:self.num_recs], separators=(',', ':'))}
+            
+            Requirements:
+            - Return ONLY a JSON array with exactly {self.num_recs} items
+            - Each item must include: sku, name, price, reason
+            - Reason should be 8-12 words describing why this product is suitable
+            - Use varied reasoning styles: "Perfect for", "Ideal choice", "Great option", "Excellent fit", ....
+            - Focus on seasonal relevance and persona priorities
+            
+            Output Format:
+            [{{"sku": "ABC", "name": "Product Name", "price": "99", "reason": "Perfect seasonal choice for active lifestyle"}}]
         """
 
         prompt_length = len(prompt)

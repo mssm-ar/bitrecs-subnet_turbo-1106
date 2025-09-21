@@ -117,8 +117,8 @@ class PromptFactory:
         # Ultra-minimal prompt for 1-3 second response time
         # Aggressive context truncation (500 chars = ~125 tokens max)
         context_str = str(self.context)
-        if len(context_str) > 600:  # Reduced from 800 for faster processing
-            context_str = context_str[:600] + "..."
+        if len(context_str) > 450:  # Reduced from 800 for faster processing
+            context_str = context_str[:450] + "..."
         
         # Simplified persona - only essential info
         try:
@@ -148,15 +148,9 @@ class PromptFactory:
             - Return ONLY a JSON array.
             - Exactly {self.num_recs} items.
             - Items must come from context_products only.
-            - Exclude target_sku and items already in cart.
-            - No duplicates.
-            - Respect gender (neutral → neutral).
-            - Keep pet and baby products separate.
 
             Reason Guidelines:
-            - Each item must have: "sku", "name", "price", "reason".
-            - Reason = detailed explanation (around 10 words) with specific context.
-            - Include specific use cases and lifestyle scenarios.
+            - Detailed explanation (around 10 words) with specific context.
             - Vary reasoning styles (Perfect/Ideal/Great choice/etc.).
 
             Format:

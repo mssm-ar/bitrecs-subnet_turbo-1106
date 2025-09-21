@@ -32,7 +32,7 @@ class ChatGPT:
                 "content": prompt,
             }],
             temperature=self.temp,
-            max_tokens=300
+            max_tokens=400
         )
 
         thing = completion.choices[0].message.content                
